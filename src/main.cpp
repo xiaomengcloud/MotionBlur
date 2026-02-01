@@ -1,10 +1,15 @@
 #include <jni.h>
+#include <android/log.h>
 #include <android/input.h>
 #include <EGL/egl.h>
+#include <GLES2/gl2.h>
 #include <GLES3/gl3.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <dlfcn.h>
+#include <string.h>
+#include <vector>
+#include <algorithm>
 
 #include "pl/Hook.h"
 #include "pl/Gloss.h"
@@ -13,163 +18,327 @@
 #include "ImGui/backends/imgui_impl_opengl3.h"
 #include "ImGui/backends/imgui_impl_android.h"
 
-static bool g_Initialized = false;
-static int g_Width = 0, g_Height = 0;
-static EGLContext g_TargetContext = EGL_NO_CONTEXT;
-static EGLSurface g_TargetSurface = EGL_NO_SURFACE;
+const char* vertexShaderSource = R"(
+attribute vec4 aPosition;
+attribute vec2 aTexCoord;
+varying vec2 vTexCoord;
+void main() {
+    gl_Position = aPosition;
+    vTexCoord = aTexCoord;
+}
+)";
 
-static EGLBoolean (*orig_eglSwapBuffers)(EGLDisplay, EGLSurface) = nullptr;
+const char* blendFragmentShaderSource = R"(
+precision mediump float;
+varying vec2 vTexCoord;
+uniform sampler2D uCurrentFrame;
+uniform sampler2D uHistoryFrame;
+uniform float uBlendFactor;
+void main() {
+    vec4 current = texture2D(uCurrentFrame, vTexCoord);
+    vec4 history = texture2D(uHistoryFrame, vTexCoord);
+    gl_FragColor = mix(current, history, uBlendFactor);
+}
+)";
 
-static void (*orig_Input1)(void*, void*, void*) = nullptr;
-static void hook_Input1(void* thiz, void* a1, void* a2) {
-    if (orig_Input1) orig_Input1(thiz, a1, a2);
-    if (thiz && g_Initialized) ImGui_ImplAndroid_HandleInputEvent((AInputEvent*)thiz);
+const char* drawFragmentShaderSource = R"(
+precision mediump float;
+varying vec2 vTexCoord;
+uniform sampler2D uTexture;
+void main() {
+    gl_FragColor = texture2D(uTexture, vTexCoord);
+}
+)";
+
+static bool motion_blur_enabled = false;
+static float blur_strength = 0.85f;
+
+static GLuint rawTexture = 0;
+static GLuint historyTextures[2] = {0, 0};
+static GLuint historyFBOs[2] = {0, 0};
+static int pingPongIndex = 0;
+
+static GLuint blendShaderProgram = 0;
+static GLint blendPosLoc = -1;
+static GLint blendTexCoordLoc = -1;
+static GLint blendCurrentLoc = -1;
+static GLint blendHistoryLoc = -1;
+static GLint blendFactorLoc = -1;
+
+static GLuint drawShaderProgram = 0;
+static GLint drawPosLoc = -1;
+static GLint drawTexCoordLoc = -1;
+static GLint drawTextureLoc = -1;
+
+static GLuint vertexBuffer = 0;
+static GLuint indexBuffer = 0;
+
+static int blur_res_width = 0;
+static int blur_res_height = 0;
+
+void initializeMotionBlurResources(GLint width, GLint height) {
+    if (rawTexture != 0) {
+        glDeleteTextures(1, &rawTexture);
+        glDeleteTextures(2, historyTextures);
+        glDeleteFramebuffers(2, historyFBOs);
+    }
+
+    if (blendShaderProgram == 0) {
+        GLuint vs = glCreateShader(GL_VERTEX_SHADER);
+        glShaderSource(vs, 1, &vertexShaderSource, nullptr);
+        glCompileShader(vs);
+
+        GLuint fsBlend = glCreateShader(GL_FRAGMENT_SHADER);
+        glShaderSource(fsBlend, 1, &blendFragmentShaderSource, nullptr);
+        glCompileShader(fsBlend);
+
+        blendShaderProgram = glCreateProgram();
+        glAttachShader(blendShaderProgram, vs);
+        glAttachShader(blendShaderProgram, fsBlend);
+        glLinkProgram(blendShaderProgram);
+
+        blendPosLoc = glGetAttribLocation(blendShaderProgram, "aPosition");
+        blendTexCoordLoc = glGetAttribLocation(blendShaderProgram, "aTexCoord");
+        blendCurrentLoc = glGetUniformLocation(blendShaderProgram, "uCurrentFrame");
+        blendHistoryLoc = glGetUniformLocation(blendShaderProgram, "uHistoryFrame");
+        blendFactorLoc = glGetUniformLocation(blendShaderProgram, "uBlendFactor");
+
+        GLuint fsDraw = glCreateShader(GL_FRAGMENT_SHADER);
+        glShaderSource(fsDraw, 1, &drawFragmentShaderSource, nullptr);
+        glCompileShader(fsDraw);
+
+        drawShaderProgram = glCreateProgram();
+        glAttachShader(drawShaderProgram, vs);
+        glAttachShader(drawShaderProgram, fsDraw);
+        glLinkProgram(drawShaderProgram);
+
+        drawPosLoc = glGetAttribLocation(drawShaderProgram, "aPosition");
+        drawTexCoordLoc = glGetAttribLocation(drawShaderProgram, "aTexCoord");
+        drawTextureLoc = glGetUniformLocation(drawShaderProgram, "uTexture");
+
+        GLfloat vertices[] = { -1.0f, 1.0f, 0.0f, 1.0f, -1.0f, -1.0f, 0.0f, 0.0f, 1.0f, -1.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f };
+        GLushort indices[] = { 0, 1, 2, 0, 2, 3 };
+
+        glGenBuffers(1, &vertexBuffer);
+        glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+
+        glGenBuffers(1, &indexBuffer);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indexBuffer);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
+    }
+
+    glGenTextures(1, &rawTexture);
+    glBindTexture(GL_TEXTURE_2D, rawTexture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    glGenTextures(2, historyTextures);
+    glGenFramebuffers(2, historyFBOs);
+
+    for (int i = 0; i < 2; i++) {
+        glBindTexture(GL_TEXTURE_2D, historyTextures[i]);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        
+        glBindFramebuffer(GL_FRAMEBUFFER, historyFBOs[i]);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, historyTextures[i], 0);
+        glClearColor(0, 0, 0, 0);
+        glClear(GL_COLOR_BUFFER_BIT);
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    blur_res_width = width;
+    blur_res_height = height;
+    pingPongIndex = 0;
 }
 
-static int32_t (*orig_Input2)(void*, void*, bool, long, uint32_t*, AInputEvent**) = nullptr;
-static int32_t hook_Input2(void* thiz, void* a1, bool a2, long a3, uint32_t* a4, AInputEvent** event) {
-    int32_t result = orig_Input2 ? orig_Input2(thiz, a1, a2, a3, a4, event) : 0;
-    if (result == 0 && event && *event && g_Initialized) {
-        ImGui_ImplAndroid_HandleInputEvent(*event);
+void apply_motion_blur(int width, int height) {
+    if (width != blur_res_width || height != blur_res_height || rawTexture == 0) {
+        initializeMotionBlurResources(width, height);
     }
+
+    int curr = pingPongIndex;
+    int prev = 1 - pingPongIndex;
+
+    glBindTexture(GL_TEXTURE_2D, rawTexture);
+    glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 0, 0, width, height, 0);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, historyFBOs[curr]);
+    glViewport(0, 0, width, height);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glUseProgram(blendShaderProgram);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, rawTexture);
+    glUniform1i(blendCurrentLoc, 0);
+
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, historyTextures[prev]);
+    glUniform1i(blendHistoryLoc, 1);
+
+    glUniform1f(blendFactorLoc, blur_strength);
+
+    glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indexBuffer);
+
+    glEnableVertexAttribArray(blendPosLoc);
+    glVertexAttribPointer(blendPosLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), nullptr);
+    glEnableVertexAttribArray(blendTexCoordLoc);
+    glVertexAttribPointer(blendTexCoordLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (void*)(2 * sizeof(GLfloat)));
+
+    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, width, height);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    glUseProgram(drawShaderProgram);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, historyTextures[curr]);
+    glUniform1i(drawTextureLoc, 0);
+
+    glEnableVertexAttribArray(drawPosLoc);
+    glVertexAttribPointer(drawPosLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), nullptr);
+    glEnableVertexAttribArray(drawTexCoordLoc);
+    glVertexAttribPointer(drawTexCoordLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (void*)(2 * sizeof(GLfloat)));
+
+    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
+
+    pingPongIndex = prev;
+}
+
+static bool g_initialized = false;
+static int g_width = 0, g_height = 0;
+static EGLContext g_targetcontext = EGL_NO_CONTEXT;
+static EGLSurface g_targetsurface = EGL_NO_SURFACE;
+static EGLBoolean (*orig_eglswapbuffers)(EGLDisplay, EGLSurface) = nullptr;
+static void (*orig_input1)(void*, void*, void*) = nullptr;
+static int32_t (*orig_input2)(void*, void*, bool, long, uint32_t*, AInputEvent**) = nullptr;
+
+static void hook_input1(void* thiz, void* a1, void* a2) {
+    if (orig_input1) orig_input1(thiz, a1, a2);
+    if (thiz && g_initialized) ImGui_ImplAndroid_HandleInputEvent((AInputEvent*)thiz);
+}
+
+static int32_t hook_input2(void* thiz, void* a1, bool a2, long a3, uint32_t* a4, AInputEvent** event) {
+    int32_t result = orig_input2 ? orig_input2(thiz, a1, a2, a3, a4, event) : 0;
+    if (result == 0 && event && *event && g_initialized) ImGui_ImplAndroid_HandleInputEvent(*event);
     return result;
 }
 
-struct GLState {
-    GLint prog, tex, aTex, aBuf, eBuf, vao, fbo, vp[4], sc[4], bSrc, bDst;
-    GLboolean blend, cull, depth, scissor;
-};
+static void drawmenu() {
+    ImGui::SetNextWindowPos(ImVec2(10, 80), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(350, 180), ImGuiCond_FirstUseEver);
 
-static void SaveGL(GLState& s) {
-    glGetIntegerv(GL_CURRENT_PROGRAM, &s.prog);
-    glGetIntegerv(GL_TEXTURE_BINDING_2D, &s.tex);
-    glGetIntegerv(GL_ACTIVE_TEXTURE, &s.aTex);
-    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &s.aBuf);
-    glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &s.eBuf);
-    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &s.vao);
-    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &s.fbo);
-    glGetIntegerv(GL_VIEWPORT, s.vp);
-    glGetIntegerv(GL_SCISSOR_BOX, s.sc);
-    glGetIntegerv(GL_BLEND_SRC_ALPHA, &s.bSrc);
-    glGetIntegerv(GL_BLEND_DST_ALPHA, &s.bDst);
-    s.blend = glIsEnabled(GL_BLEND);
-    s.cull = glIsEnabled(GL_CULL_FACE);
-    s.depth = glIsEnabled(GL_DEPTH_TEST);
-    s.scissor = glIsEnabled(GL_SCISSOR_TEST);
-}
+    ImGui::Begin("Natural Motion Blur", nullptr);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(16, 12));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 10.0f);
+    ImGui::SetWindowFontScale(1.2f);
 
-static void RestoreGL(const GLState& s) {
-    glUseProgram(s.prog);
-    glActiveTexture(s.aTex);
-    glBindTexture(GL_TEXTURE_2D, s.tex);
-    glBindBuffer(GL_ARRAY_BUFFER, s.aBuf);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s.eBuf);
-    glBindVertexArray(s.vao);
-    glBindFramebuffer(GL_FRAMEBUFFER, s.fbo);
-    glViewport(s.vp[0], s.vp[1], s.vp[2], s.vp[3]);
-    glScissor(s.sc[0], s.sc[1], s.sc[2], s.sc[3]);
-    glBlendFunc(s.bSrc, s.bDst);
-    s.blend ? glEnable(GL_BLEND) : glDisable(GL_BLEND);
-    s.cull ? glEnable(GL_CULL_FACE) : glDisable(GL_CULL_FACE);
-    s.depth ? glEnable(GL_DEPTH_TEST) : glDisable(GL_DEPTH_TEST);
-    s.scissor ? glEnable(GL_SCISSOR_TEST) : glDisable(GL_SCISSOR_TEST);
-}
+    ImGui::Checkbox("Enable Motion Blur", &motion_blur_enabled);
+    
+    if (motion_blur_enabled) {
+        ImGui::Spacing();
+        ImGui::Text("Blur Strength (Trail Length)");
+        ImGui::SliderFloat("##Strength", &blur_strength, 0.5f, 0.98f, "%.2f");
+    }
 
-static void DrawMenu() {
-    ImGuiIO& io = ImGui::GetIO();
-    ImGui::SetNextWindowSize(ImVec2(200, 0), ImGuiCond_FirstUseEver);
-    ImGui::Begin("FPS", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_AlwaysAutoResize);
-    ImGui::Text("%.1f FPS", io.Framerate);
+    ImGui::PopStyleVar(2);
     ImGui::End();
 }
 
-static void Setup() {
-    if (g_Initialized || g_Width <= 0 || g_Height <= 0) return;
+static void setup() {
+    if (g_initialized || g_width <= 0) return;
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
-    float scale = (float)g_Height / 720.0f;
-    if (scale < 1.5f) scale = 1.5f;
-    if (scale > 4.0f) scale = 4.0f;
-    ImFontConfig cfg;
-    cfg.SizePixels = 32.0f * scale;
-    io.Fonts->AddFontDefault(&cfg);
+    io.FontGlobalScale = 1.4f;
     ImGui_ImplAndroid_Init();
     ImGui_ImplOpenGL3_Init("#version 300 es");
-    ImGui::GetStyle().ScaleAllSizes(scale);
-    g_Initialized = true;
+    g_initialized = true;
 }
 
-static void Render() {
-    if (!g_Initialized) return;
-    GLState s;
-    SaveGL(s);
+static void render() {
+    if (!g_initialized) return;
+
+    GLint last_prog; glGetIntegerv(GL_CURRENT_PROGRAM, &last_prog);
+    GLint last_tex; glGetIntegerv(GL_TEXTURE_BINDING_2D, &last_tex);
+    GLint last_array_buffer; glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &last_array_buffer);
+    GLint last_element_array_buffer; glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &last_element_array_buffer);
+    GLint last_fbo; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &last_fbo);
+    GLint last_viewport[4]; glGetIntegerv(GL_VIEWPORT, last_viewport);
+
+    if (motion_blur_enabled) {
+        apply_motion_blur(g_width, g_height);
+    }
+
     ImGuiIO& io = ImGui::GetIO();
-    io.DisplaySize = ImVec2((float)g_Width, (float)g_Height);
+    io.DisplaySize = ImVec2((float)g_width, (float)g_height);
     ImGui_ImplOpenGL3_NewFrame();
-    ImGui_ImplAndroid_NewFrame(g_Width, g_Height);
+    ImGui_ImplAndroid_NewFrame(g_width, g_height);
     ImGui::NewFrame();
-    DrawMenu();
+    
+    drawmenu();
+    
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-    RestoreGL(s);
+
+    glUseProgram(last_prog);
+    glBindTexture(GL_TEXTURE_2D, last_tex);
+    glBindBuffer(GL_ARRAY_BUFFER, last_array_buffer);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, last_element_array_buffer);
+    glBindFramebuffer(GL_FRAMEBUFFER, last_fbo);
+    glViewport(last_viewport[0], last_viewport[1], last_viewport[2], last_viewport[3]);
 }
 
-static EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
-    if (!orig_eglSwapBuffers) return EGL_FALSE;
+static EGLBoolean hook_eglswapbuffers(EGLDisplay dpy, EGLSurface surf) {
+    if (!orig_eglswapbuffers) return EGL_FALSE;
     EGLContext ctx = eglGetCurrentContext();
-    if (ctx == EGL_NO_CONTEXT) return orig_eglSwapBuffers(dpy, surf);
-    EGLint w = 0, h = 0;
+    if (ctx == EGL_NO_CONTEXT || (g_targetcontext != EGL_NO_CONTEXT && (ctx != g_targetcontext || surf != g_targetsurface)))
+        return orig_eglswapbuffers(dpy, surf);
+    
+    EGLint w, h;
     eglQuerySurface(dpy, surf, EGL_WIDTH, &w);
     eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
-    if (w < 500 || h < 500) return orig_eglSwapBuffers(dpy, surf);
-    if (g_TargetContext == EGL_NO_CONTEXT) {
-        EGLint buf = 0;
-        eglQuerySurface(dpy, surf, EGL_RENDER_BUFFER, &buf);
-        if (buf == EGL_BACK_BUFFER) {
-            g_TargetContext = ctx;
-            g_TargetSurface = surf;
-        }
-    }
-    if (ctx != g_TargetContext || surf != g_TargetSurface)
-        return orig_eglSwapBuffers(dpy, surf);
-    g_Width = w;
-    g_Height = h;
-    Setup();
-    Render();
-    return orig_eglSwapBuffers(dpy, surf);
+    if (w < 100 || h < 100) return orig_eglswapbuffers(dpy, surf);
+
+    if (g_targetcontext == EGL_NO_CONTEXT) { g_targetcontext = ctx; g_targetsurface = surf; }
+    g_width = w; g_height = h;
+    
+    setup();
+    render();
+    
+    return orig_eglswapbuffers(dpy, surf);
 }
 
-static void HookInput() {
-    void* sym1 = (void*)GlossSymbol(GlossOpen("libinput.so"),
-        "_ZN7android13InputConsumer21initializeMotionEventEPNS_11MotionEventEPKNS_12InputMessageE", nullptr);
-    if (sym1) {
-        GHook h = GlossHook(sym1, (void*)hook_Input1, (void**)&orig_Input1);
-        if (h) return;
-    }
-    void* sym2 = (void*)GlossSymbol(GlossOpen("libinput.so"),
-        "_ZN7android13InputConsumer7consumeEPNS_26InputEventFactoryInterfaceEblPjPPNS_10InputEventE", nullptr);
-    if (sym2) {
-        GHook h = GlossHook(sym2, (void*)hook_Input2, (void**)&orig_Input2);
-        if (h) return;
-    }
+static void hookinput() {
+    void* sym = (void*)GlossSymbol(GlossOpen("libinput.so"), "_ZN7android13InputConsumer7consumeEPNS_26InputEventFactoryInterfaceEblPjPPNS_10InputEventE", nullptr);
+    if (sym) GlossHook(sym, (void*)hook_input2, (void**)&orig_input2);
 }
 
-static void* MainThread(void*) {
+static void* mainthread(void*) {
     sleep(3);
     GlossInit(true);
-    GHandle hEGL = GlossOpen("libEGL.so");
-    if (!hEGL) return nullptr;
-    void* swap = (void*)GlossSymbol(hEGL, "eglSwapBuffers", nullptr);
-    if (!swap) return nullptr;
-    GHook h = GlossHook(swap, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
-    if (!h) return nullptr;
-    HookInput();
+    GHandle hegl = GlossOpen("libEGL.so");
+
+    if (hegl) {
+        void* swap = (void*)GlossSymbol(hegl, "eglSwapBuffers", nullptr);
+        if (swap) GlossHook(swap, (void*)hook_eglswapbuffers, (void**)&orig_eglswapbuffers);
+    }
+
+    hookinput();
     return nullptr;
 }
 
 __attribute__((constructor))
-void DisplayFPS_Init() {
+void display_init() {
     pthread_t t;
-    pthread_create(&t, nullptr, MainThread, nullptr);
+    pthread_create(&t, nullptr, mainthread, nullptr);
 }

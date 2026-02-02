@@ -289,7 +289,7 @@ static void drawmenu() {
     if (motion_blur_enabled) {
         ImGui::Spacing();
         ImGui::Text("Blur Strength (Trail Length)");
-        ImGui::SliderFloat("##Strength", &blur_strength, 0.5f, 0.98f, "%.2f");
+        ImGui::SliderFloat("##Strength", &blur_strength, 0.0f, 0.98f, "%.2f");
     }
 
     ImGui::PopStyleVar(2);

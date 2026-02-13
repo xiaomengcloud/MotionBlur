@@ -1,6 +1,5 @@
 #include <jni.h>
 #include <android/log.h>
-#include <android/input.h>
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
 #include <GLES3/gl3.h>
@@ -8,15 +7,9 @@
 #include <unistd.h>
 #include <dlfcn.h>
 #include <string.h>
-#include <vector>
-#include <algorithm>
 
 #include "pl/Hook.h"
 #include "pl/Gloss.h"
-
-#include "ImGui/imgui.h"
-#include "ImGui/backends/imgui_impl_opengl3.h"
-#include "ImGui/backends/imgui_impl_android.h"
 
 const char* vertexShaderSource = R"(
 attribute vec4 aPosition;
@@ -52,7 +45,7 @@ void main() {
 }
 )";
 
-static bool motion_blur_enabled = false;
+static bool motion_blur_enabled = true;
 static float blur_strength = 0.85f;
 
 static GLuint rawTexture = 0;
@@ -154,7 +147,7 @@ void initializeMotionBlurResources(GLint width, GLint height) {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        
+
         glBindFramebuffer(GL_FRAMEBUFFER, historyFBOs[i]);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, historyTextures[i], 0);
         glClearColor(0, 0, 0, 1);
@@ -188,28 +181,28 @@ void apply_motion_blur(int width, int height) {
     if (isFirstFrame) {
         glBindFramebuffer(GL_FRAMEBUFFER, historyFBOs[curr]);
         glViewport(0, 0, width, height);
-        
+
         glUseProgram(drawShaderProgram);
-        
+
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, rawTexture);
         glUniform1i(drawTextureLoc, 0);
-        
+
         glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indexBuffer);
-        
+
         glEnableVertexAttribArray(drawPosLoc);
         glVertexAttribPointer(drawPosLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), nullptr);
         glEnableVertexAttribArray(drawTexCoordLoc);
         glVertexAttribPointer(drawTexCoordLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (void*)(2 * sizeof(GLfloat)));
-        
+
         glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
-        
+
         isFirstFrame = false;
     } else {
         glBindFramebuffer(GL_FRAMEBUFFER, historyFBOs[curr]);
         glViewport(0, 0, width, height);
-        
+
         glUseProgram(blendShaderProgram);
 
         glActiveTexture(GL_TEXTURE0);
@@ -256,60 +249,12 @@ void apply_motion_blur(int width, int height) {
     pingPongIndex = prev;
 }
 
-static bool g_initialized = false;
 static int g_width = 0, g_height = 0;
 static EGLContext g_targetcontext = EGL_NO_CONTEXT;
 static EGLSurface g_targetsurface = EGL_NO_SURFACE;
 static EGLBoolean (*orig_eglswapbuffers)(EGLDisplay, EGLSurface) = nullptr;
-static void (*orig_input1)(void*, void*, void*) = nullptr;
-static int32_t (*orig_input2)(void*, void*, bool, long, uint32_t*, AInputEvent**) = nullptr;
-
-static void hook_input1(void* thiz, void* a1, void* a2) {
-    if (orig_input1) orig_input1(thiz, a1, a2);
-    if (thiz && g_initialized) ImGui_ImplAndroid_HandleInputEvent((AInputEvent*)thiz);
-}
-
-static int32_t hook_input2(void* thiz, void* a1, bool a2, long a3, uint32_t* a4, AInputEvent** event) {
-    int32_t result = orig_input2 ? orig_input2(thiz, a1, a2, a3, a4, event) : 0;
-    if (result == 0 && event && *event && g_initialized) ImGui_ImplAndroid_HandleInputEvent(*event);
-    return result;
-}
-
-static void drawmenu() {
-    ImGui::SetNextWindowPos(ImVec2(10, 80), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(350, 180), ImGuiCond_FirstUseEver);
-
-    ImGui::Begin("Natural Motion Blur", nullptr);
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(16, 12));
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 10.0f);
-    ImGui::SetWindowFontScale(1.2f);
-
-    ImGui::Checkbox("Enable Motion Blur", &motion_blur_enabled);
-    
-    if (motion_blur_enabled) {
-        ImGui::Spacing();
-        ImGui::Text("Blur Strength (Trail Length)");
-        ImGui::SliderFloat("##Strength", &blur_strength, 0.0f, 0.98f, "%.2f");
-    }
-
-    ImGui::PopStyleVar(2);
-    ImGui::End();
-}
-
-static void setup() {
-    if (g_initialized || g_width <= 0) return;
-    ImGui::CreateContext();
-    ImGuiIO& io = ImGui::GetIO();
-    io.IniFilename = nullptr;
-    io.FontGlobalScale = 1.4f;
-    ImGui_ImplAndroid_Init();
-    ImGui_ImplOpenGL3_Init("#version 300 es");
-    g_initialized = true;
-}
 
 static void render() {
-    if (!g_initialized) return;
-
     GLint last_prog; glGetIntegerv(GL_CURRENT_PROGRAM, &last_prog);
     GLint last_tex; glGetIntegerv(GL_TEXTURE_BINDING_2D, &last_tex);
     GLint last_array_buffer; glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &last_array_buffer);
@@ -323,17 +268,6 @@ static void render() {
     if (motion_blur_enabled) {
         apply_motion_blur(g_width, g_height);
     }
-
-    ImGuiIO& io = ImGui::GetIO();
-    io.DisplaySize = ImVec2((float)g_width, (float)g_height);
-    ImGui_ImplOpenGL3_NewFrame();
-    ImGui_ImplAndroid_NewFrame(g_width, g_height);
-    ImGui::NewFrame();
-    
-    drawmenu();
-    
-    ImGui::Render();
-    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
     glUseProgram(last_prog);
     glBindTexture(GL_TEXTURE_2D, last_tex);
@@ -351,7 +285,7 @@ static EGLBoolean hook_eglswapbuffers(EGLDisplay dpy, EGLSurface surf) {
     EGLContext ctx = eglGetCurrentContext();
     if (ctx == EGL_NO_CONTEXT || (g_targetcontext != EGL_NO_CONTEXT && (ctx != g_targetcontext || surf != g_targetsurface)))
         return orig_eglswapbuffers(dpy, surf);
-    
+
     EGLint w, h;
     eglQuerySurface(dpy, surf, EGL_WIDTH, &w);
     eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
@@ -359,16 +293,10 @@ static EGLBoolean hook_eglswapbuffers(EGLDisplay dpy, EGLSurface surf) {
 
     if (g_targetcontext == EGL_NO_CONTEXT) { g_targetcontext = ctx; g_targetsurface = surf; }
     g_width = w; g_height = h;
-    
-    setup();
-    render();
-    
-    return orig_eglswapbuffers(dpy, surf);
-}
 
-static void hookinput() {
-    void* sym = (void*)GlossSymbol(GlossOpen("libinput.so"), "_ZN7android13InputConsumer7consumeEPNS_26InputEventFactoryInterfaceEblPjPPNS_10InputEventE", nullptr);
-    if (sym) GlossHook(sym, (void*)hook_input2, (void**)&orig_input2);
+    render();
+
+    return orig_eglswapbuffers(dpy, surf);
 }
 
 static void* mainthread(void*) {
@@ -381,7 +309,6 @@ static void* mainthread(void*) {
         if (swap) GlossHook(swap, (void*)hook_eglswapbuffers, (void**)&orig_eglswapbuffers);
     }
 
-    hookinput();
     return nullptr;
 }
 
